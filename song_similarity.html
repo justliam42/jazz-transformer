@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>iReal Song Similarity</title>
+  <style>
+    :root { color-scheme: light; font: 16px/1.5 system-ui, sans-serif; }
+    body { max-width: 760px; margin: 3rem auto; padding: 0 1rem; color: #20242a; }
+    h1 { margin-bottom: .35rem; }
+    p { color: #59636e; }
+    label { display: block; margin-top: 1.5rem; font-weight: 650; }
+    select { box-sizing: border-box; width: 100%; margin-top: .4rem; padding: .65rem; }
+    table { width: 100%; margin-top: 1.5rem; border-collapse: collapse; }
+    th, td { padding: .65rem .5rem; border-bottom: 1px solid #dfe3e8; text-align: left; }
+    th:last-child, td:last-child { width: 9rem; text-align: right; font-variant-numeric: tabular-nums; }
+    #status { margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>iReal Song Similarity</h1>
+  <p>Choose a chart to rank the others by cosine distance between song embeddings.
+    After exporting embeddings, run <code>python -m http.server 8000</code> in this folder.</p>
+  <label for="song">Selected song</label>
+  <select id="song" disabled>
+    <option>Loading songs…</option>
+  </select>
+  <p id="status" role="status"></p>
+  <table>
+    <thead><tr><th>Similar song</th><th>Cosine distance</th></tr></thead>
+    <tbody id="results"></tbody>
+  </table>
+  <script>
+    const selector = document.querySelector("#song");
+    const status = document.querySelector("#status");
+    const results = document.querySelector("#results");
+    let songs = [];
+
+    function label(song) {
+      return [song.title, song.composer, song.key].filter(Boolean).join(" — ");
+    }
+
+    function cosineDistance(left, right) {
+      let dot = 0;
+      let leftNorm = 0;
+      let rightNorm = 0;
+      for (let i = 0; i < left.length; i++) {
+        dot += left[i] * right[i];
+        leftNorm += left[i] * left[i];
+        rightNorm += right[i] * right[i];
+      }
+      if (leftNorm === 0 || rightNorm === 0) return 1;
+      return 1 - dot / Math.sqrt(leftNorm * rightNorm);
+    }
+
+    function showClosest() {
+      const selectedIndex = Number(selector.value);
+      const selected = songs[selectedIndex];
+      const closest = songs
+        .map((song, index) => ({
+          song,
+          index,
+          distance: cosineDistance(selected.embedding, song.embedding),
+        }))
+        .filter((entry) => entry.index !== selectedIndex)
+        .sort((a, b) => a.distance - b.distance || label(a.song).localeCompare(label(b.song)));
+
+      results.replaceChildren();
+      for (const entry of closest) {
+        const row = document.createElement("tr");
+        const title = document.createElement("td");
+        const distance = document.createElement("td");
+        title.textContent = label(entry.song);
+        distance.textContent = entry.distance.toFixed(5);
+        row.append(title, distance);
+        results.append(row);
+      }
+      status.textContent = `${closest.length} other charts, ordered from closest to farthest.`;
+    }
+
+    fetch("song_embeddings.json")
+      .then((response) => {
+        if (!response.ok) throw new Error("Could not load song_embeddings.json");
+        return response.json();
+      })
+      .then((data) => {
+        songs = data.songs;
+        if (!Array.isArray(songs) || songs.length < 2) {
+          throw new Error("The embedding file must contain at least two songs.");
+        }
+        selector.replaceChildren();
+        songs.forEach((song, index) => {
+          const option = document.createElement("option");
+          option.value = index;
+          option.textContent = label(song);
+          selector.append(option);
+        });
+        selector.disabled = false;
+        selector.addEventListener("change", showClosest);
+        showClosest();
+      })
+      .catch((error) => {
+        status.textContent = `${error.message}. Generate embeddings, then serve this folder over HTTP.`;
+      });
+  </script>
+</body>
+</html>
