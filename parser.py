@@ -13,6 +13,10 @@ class Tune(object):
        codas etc.
     :ivar measures_as_strings: A list, for which every element corresponds to a single bar, containing the chords in
        string form. Repeats, codas etc. have been flattened.
+    :ivar measures_as_beats: A list of measures, each containing one chord/event string per beat. Empty beats contain
+       a single space.
+    :ivar measure_sections: A list of section labels aligned with measures_as_strings; labels are None before the
+       first section marker.
     :ivar title: The title
     :ivar composer: The composer
     :ivar style: The style (e.g. 'Swing', 'Bossa', 'Blues' etc.)
@@ -30,7 +34,7 @@ class Tune(object):
 
     _chords_prefix = """1r34LbKcu7"""
 
-    chord_regex = re.compile(r'(?<!/)([A-GNn][^A-GN/]*(?:/[A-GN][#b]?)?)')
+    chord_regex = re.compile(r'(?<!/)([A-GNn][^\sA-GN/]*(?:/[A-GN][#b]?)?)')
 
     @classmethod
     def _obfusc50(cls, block):
@@ -142,7 +146,22 @@ class Tune(object):
         if repeat_match is None:
             return chord_string
         # is there a first ending in the repeat?
-        number_match = re.search(r'N(\d)', repeat_match.group(1))
+        number_matches = list(re.finditer(r'N(\d)', repeat_match.group(1)))
+        if len(number_matches) > 1:
+            repeated_measures = repeat_match.group(1)[:number_matches[0].start()]
+            endings = [
+                repeat_match.group(1)[match.end():(
+                    number_matches[i + 1].start() if i + 1 < len(number_matches) else len(repeat_match.group(1))
+                )]
+                for i, match in enumerate(number_matches)
+            ]
+            expanded_repeat = ''.join(repeated_measures + ending for ending in endings)
+            new_chord_string = (
+                chord_string[:repeat_match.start()] + '|' + expanded_repeat + '|' +
+                chord_string[repeat_match.end():]
+            )
+            return cls._fill_long_repeats(new_chord_string)
+        number_match = number_matches[0] if number_matches else None
         if number_match is not None:
             first_repeat = repeat_match.group(1)
             # first, get rid of the first repeat number and the curly braces
@@ -198,7 +217,7 @@ class Tune(object):
         return chord_string
 
     @classmethod
-    def _fill_single_double_repeats(cls, measures):
+    def _fill_single_double_repeats(cls, measures, sections=None):
         """Replaces one- and two-measure repeat symbols with the appropriate chords
         :param measures: A list of measures (as strings)
         :return: A list of measures with filled repeats
@@ -214,6 +233,8 @@ class Tune(object):
                 first = cls._remove_markers(measures[i-2])
                 second = cls._remove_markers(measures[i-1])
                 measures = measures[:i] + [first, second] + measures[i+1:]
+                if sections is not None:
+                    sections[:] = sections[:i] + [sections[i], sections[i]] + sections[i+1:]
                 i += 1
             i += 1
         return measures
@@ -224,16 +245,23 @@ class Tune(object):
         :param measures: List of measures (as strings)
         :return: A list of measures with filled slashes
         """
-        for i in range(1, len(measures)):
+        for i in range(len(measures)):
             while measures[i].find('p') != -1:
                 slash = measures[i].find('p')
-                if slash == 0:
-                    prev_chord = cls.chord_regex.findall(measures[i - 1])[-1]
-                    measures[i] = prev_chord + measures[i][1:]
-                    measures[i] = re.sub(r'^(p+)', prev_chord, measures[i])
-                else:
-                    prev_chord = cls.chord_regex.findall(measures[i][:slash])[-1]
-                    measures[i] = measures[i][:slash] + prev_chord + measures[i][slash + 1:]
+                previous_chords = cls.chord_regex.findall(measures[i][:slash])
+                if not previous_chords:
+                    previous_chords = [
+                        chord
+                        for previous_measure in reversed(measures[:i])
+                        for chord in cls.chord_regex.findall(previous_measure)
+                    ]
+                if not previous_chords:
+                    measures[i] = measures[i][:slash] + ' ' + measures[i][slash + 1:]
+                    continue
+                prev_chord = previous_chords[-1]
+                repeated_slashes = re.match(r'p+', measures[i][slash:]).group()
+                replacement = ' '.join([prev_chord] * len(repeated_slashes))
+                measures[i] = measures[i][:slash] + replacement + measures[i][slash + len(repeated_slashes):]
         return measures
 
     @classmethod
@@ -244,8 +272,8 @@ class Tune(object):
         :return: List of measures with added spaces
         """
         for i in range(len(measures)):
-            chords = cls.chord_regex.findall(measures[i])
-            measures[i] = ' '.join(chords)
+            chords = [chord.strip() for chord in cls.chord_regex.findall(measures[i])]
+            measures[i] = ', '.join(chords)
         return measures
 
     @classmethod
@@ -256,28 +284,155 @@ class Tune(object):
         :return: List of measures
         """
         for i in range(len(measures)):
-            measures[i] = measures[i].replace('nn', 'N.C.').replace('n', 'N.C.')
+            chords = measures[i].split(', ')
+            chords = ['' if chord.strip().lower() in ('n', 'nn') else chord for chord in chords]
+            measures[i] = ', '.join(chords) if any(chords) else ' '
         return measures
 
     @classmethod
-    def _get_measures(cls, chord_string):
-        """Splits a chord string into a list of measures, where empty measures are discarded.
-        Cleans up the chord string, removes annotations, and handles repeats & codas as well.
-        :param chord_string: A chord string
-        :return: A list of measures, with the contents of every measure as a string
-        """
+    def _get_measures_with_sections(cls, chord_string):
+        """Flatten a chord string into measure strings and aligned section labels."""
         chord_string = cls._cleanup_chord_string(chord_string)
+        section_labels = {}
+
+        def preserve_section(match):
+            marker_id = len(section_labels)
+            section_labels[marker_id] = match.group(1)
+            return '\x01' + str(marker_id) + '\x02'
+
+        chord_string = re.sub(r'\*([A-Za-z])', preserve_section, chord_string)
         chord_string = cls._remove_annotations(chord_string)
         chord_string = cls._fill_long_repeats(chord_string)
         chord_string = cls._fill_codas(chord_string)
-        measures = re.split(r'\||LZ|K|Z|{|}|\[|\]', chord_string)
-        measures = [measure.replace(' ', '') for measure in measures if measure.strip() != '']
-        measures = cls._fill_single_double_repeats(measures)
+        raw_measures = re.split(r'\||LZ|K|Z|{|}|\[|\]', chord_string)
+        measures = []
+        sections = []
+        section = None
+        for raw_measure in raw_measures:
+            section_markers = re.findall(r'\x01(\d+)\x02', raw_measure)
+            if section_markers:
+                section = section_labels[int(section_markers[-1])]
+            measure = re.sub(r'\x01\d+\x02', '', raw_measure)
+            if measure:
+                measures.append(measure)
+                sections.append(section)
+        measures = cls._fill_single_double_repeats(measures, sections)
         measures = cls._fill_slashes(measures)
         measures = cls._add_space_between_chords(measures)
         measures = cls._replace_no_chords(measures)
 
+        return measures, sections
+
+    @classmethod
+    def _get_measures(cls, chord_string):
+        """Return flattened measures as strings, discarding empty measures."""
+        measures, _ = cls._get_measures_with_sections(chord_string)
         return measures
+
+    @classmethod
+    def _get_measures_as_beats(cls, chord_string, measures_as_strings, beats_per_measure):
+        """Place iReal chord cells on beats and align them with the expanded measures."""
+        empty_cell = '\x01'
+        separator = '\x02'
+        chord_string = chord_string.replace('XyQ', empty_cell * 3)
+        chord_string = chord_string.replace(',', separator).replace(' ', empty_cell)
+        chord_string = cls._cleanup_chord_string(chord_string)
+
+        def repeat_marker(measure):
+            return re.sub(r'[\x01\x02]', '', measure).strip()
+
+        rows = []
+        markers = []
+        measure_beats = []
+        current_beat_count = max(1, beats_per_measure)
+        raw_measures = re.split(r'\||LZ|K|Z|{|}|\[|\]', chord_string)
+        for raw_measure in raw_measures:
+            time_signature = re.search(r'T(\d)\d', raw_measure)
+            if time_signature:
+                current_beat_count = int(time_signature.group(1))
+            raw_measure = cls._remove_annotations(raw_measure)
+            if not re.sub(r'[\x01\x02]', '', raw_measure).strip():
+                continue
+            cell_source = cls._remove_markers(raw_measure).replace(separator, '')
+            canonical = cls._remove_markers(
+                raw_measure.replace(separator, ' ').replace(empty_cell, ' ')
+            )
+            rows.append((cell_source, canonical))
+            markers.append(repeat_marker(raw_measure))
+            measure_beats.append(max(1, current_beat_count))
+
+        for i in range(1, len(rows)):
+            if markers[i] == 'x':
+                rows[i] = rows[i - 1]
+                markers[i] = ''
+        i = 2
+        while i < len(rows):
+            if markers[i] == 'r':
+                rows[i:i + 1] = [rows[i - 2], rows[i - 1]]
+                markers[i:i + 1] = [markers[i - 2], markers[i - 1]]
+                measure_beats[i:i + 1] = [measure_beats[i - 2], measure_beats[i - 1]]
+                i += 1
+            i += 1
+
+        default_beat_count = max(1, beats_per_measure)
+        candidate_beats = []
+        canonical_measures = [row[1] for row in rows]
+        cell_chord_regex = re.compile(
+            r'(?<!/)(nn|[A-GNn][^\sA-GNn/p\x01]*(?:/[A-G][#b]?)?)'
+        )
+        for (cell_source, _), beat_count in zip(rows, measure_beats):
+            cells = []
+            segments = cell_source.split(empty_cell)
+            for segment_index, segment in enumerate(segments):
+                position = 0
+                for match in cell_chord_regex.finditer(segment):
+                    preceding_slashes = segment[position:match.start()].count('p')
+                    cells.extend([' '] * preceding_slashes)
+                    chord = match.group(1)
+                    cells.append('N.C.' if chord.lower() in ('n', 'nn') else chord)
+                    position = match.end()
+                trailing_slashes = segment[position:].count('p')
+                cells.extend([' '] * trailing_slashes)
+                if segment_index < len(segments) - 1:
+                    cells.append(' ')
+
+            if not cells:
+                candidate_beats.append([' '] * beat_count)
+                continue
+            beats = [' '] * beat_count
+            for cell_index, chord in enumerate(cells):
+                beat_index = min(beat_count - 1, cell_index * beat_count // len(cells))
+                if chord.strip():
+                    while beat_index < beat_count - 1 and beats[beat_index].strip():
+                        beat_index += 1
+                    if beats[beat_index].strip():
+                        beats[beat_index] += ', ' + chord
+                    else:
+                        beats[beat_index] = chord
+            candidate_beats.append(beats)
+
+        canonical_measures = cls._fill_slashes(canonical_measures)
+        canonical_measures = cls._add_space_between_chords(canonical_measures)
+        canonical_measures = cls._replace_no_chords(canonical_measures)
+
+        def chord_key(measure):
+            measure = measure.replace('N.C.', '')
+            return tuple(cls.chord_regex.findall(measure))
+
+        candidate_keys = [chord_key(measure) for measure in canonical_measures]
+        measures_as_beats = []
+        source_index = 0
+        for measure in measures_as_strings:
+            key = chord_key(measure)
+            matches = [i for i, candidate in enumerate(candidate_keys) if candidate == key]
+            if not matches:
+                measures_as_beats.append([' '] * default_beat_count)
+                continue
+            following = [i for i in matches if i >= source_index]
+            source_index = following[0] if following else matches[0]
+            measures_as_beats.append(candidate_beats[source_index])
+            source_index += 1
+        return measures_as_beats
 
     @classmethod
     def _get_time_signature(cls, chord_string):
@@ -320,7 +475,10 @@ class Tune(object):
         self.raw_chord_string = self._unscramble_chord_string(chords_scrambled)
         self.chord_string = self._cleanup_chord_string(self.raw_chord_string)
         self.time_signature = self._get_time_signature(self.chord_string)
-        self.measures_as_strings = self._get_measures(self.chord_string)
+        self.measures_as_strings, self.measure_sections = self._get_measures_with_sections(self.chord_string)
+        self.measures_as_beats = self._get_measures_as_beats(
+            self.raw_chord_string, self.measures_as_strings, self.time_signature[0]
+        )
 
 
     def __repr__(self):
@@ -392,5 +550,7 @@ class Tune(object):
             'repeats': self.repeats,
             'time_signature': self.time_signature,
             'chord_string': self.chord_string,
-            'measures_as_strings': self.measures_as_strings
+            'measures_as_strings': self.measures_as_strings,
+            'measure_sections': self.measure_sections,
+            'measures_as_beats': self.measures_as_beats
         }
